@@ -41,3 +41,12 @@ WHERE a.quality_drop_flag;
 -- 4. Checks
 SELECT "table", diststyle, sortkey1, tbl_rows, skew_rows
 FROM svv_table_info WHERE schema = 'warehouse' ORDER BY "table";
+
+-- Stage 3: after the SCD2 rebuild, reload the versioned dimension and fact table
+-- (drop the materialized view first, because it depends on these tables)
+DROP MATERIALIZED VIEW IF EXISTS warehouse.mv_quality_alerts;
+DROP TABLE IF EXISTS warehouse.dim_product;
+CREATE TABLE warehouse.dim_product DISTSTYLE ALL SORTKEY (product_key) AS SELECT * FROM lake.dim_product;
+DROP TABLE IF EXISTS warehouse.fact_reviews;
+CREATE TABLE warehouse.fact_reviews DISTSTYLE EVEN SORTKEY (date_key) AS SELECT * FROM lake.fact_reviews;
+-- then recreate warehouse.mv_quality_alerts (see above)

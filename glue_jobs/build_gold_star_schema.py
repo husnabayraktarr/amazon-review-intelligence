@@ -65,25 +65,8 @@ dim_date = spark.sql("""
     FROM (SELECT explode(sequence(to_date('1996-01-01'), to_date('2023-12-31'), interval 1 day)) AS d)
 """)
 
-# ---------- dim_product: SCD2-ready (one version per product for now; price history arrives in stage 3) ----------
-dim_product = (
-    products
-    .withColumn("valid_from", F.to_timestamp(F.lit("1900-01-01 00:00:00")))
-    .withColumn("valid_to", F.to_timestamp(F.lit("9999-12-31 23:59:59")))
-    .withColumn("is_current", F.lit(True))
-    .withColumn("product_key", F.xxhash64("parent_asin", "valid_from"))   # surrogate key per version
-    .withColumn(
-        "price_band",
-        F.when(F.col("price").isNull(), "unknown")
-         .when(F.col("price") < 25, "under_25")
-         .when(F.col("price") < 100, "25_to_100")
-         .when(F.col("price") < 500, "100_to_500")
-         .otherwise("500_plus"),
-    )
-    .select("product_key", "parent_asin", "category", "main_category", "title", "brand",
-            "category_path", "price", "price_band", "average_rating", "rating_number",
-            "valid_from", "valid_to", "is_current")
-)
+# ---------- dim_product: SCD Type 2 history built from DMS CDC (stage 3) ----------
+dim_product = spark.table(f"glue_catalog.{DB}.dim_product_history")
 
 # ---------- fact_reviews: grain = one review ----------
 # Join on the product version that was valid when the review was written (SCD2 lookup).
@@ -94,7 +77,7 @@ fact_reviews = (
     r.join(
         p,
         (F.col("r.parent_asin") == F.col("p.parent_asin"))
-        & F.col("r.review_ts").between(F.col("p.valid_from"), F.col("p.valid_to")),
+        & (F.col("r.review_ts") >= F.col("p.valid_from")) & (F.col("r.review_ts") < F.col("p.valid_to")),
         "left",
     )
     .select(
