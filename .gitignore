@@ -4,3 +4,8 @@ __pycache__/
 .env
 *.csv
 *.zip
+.terraform/
+*.tfstate
+*.tfstate.*
+infra/terraform/tfplan
+infra/terraform/plan.txt
