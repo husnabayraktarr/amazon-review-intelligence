@@ -14,8 +14,13 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import (ArrayType, BooleanType, DoubleType, LongType,
                                MapType, StringType, StructField, StructType)
 
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "BUCKET", "CATEGORY", "HASH_SALT"])
-BUCKET, CATEGORY, SALT = args["BUCKET"], args["CATEGORY"], args["HASH_SALT"]
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "BUCKET", "CATEGORY"])
+BUCKET, CATEGORY = args["BUCKET"], args["CATEGORY"]
+
+# The hash salt lives in Secrets Manager, never in code or job parameters
+import boto3
+SALT = boto3.client("secretsmanager", region_name="us-east-1").get_secret_value(
+    SecretId="review-project/hash-salt")["SecretString"]
 
 DB = "reviews_db"
 TABLE = f"glue_catalog.{DB}.silver_reviews"
