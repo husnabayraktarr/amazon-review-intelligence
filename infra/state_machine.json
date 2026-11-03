@@ -1,0 +1,130 @@
+{
+  "Comment": "Amazon review intelligence: batch pipeline (bronze -> silver -> SCD2 -> gold -> Redshift)",
+  "StartAt": "BronzeToSilver",
+  "States": {
+    "BronzeToSilver": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "ReviewsBronzeToSilver",
+          "States": {
+            "ReviewsBronzeToSilver": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {"JobName": "reviews-bronze-to-silver", "Arguments": {"--CATEGORY": "Appliances"}},
+              "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 1}],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ProductsBronzeToSilver",
+          "States": {
+            "ProductsBronzeToSilver": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {"JobName": "products-bronze-to-silver", "Arguments": {"--CATEGORY": "Appliances"}},
+              "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 1}],
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+      "Next": "BuildProductHistory"
+    },
+    "BuildProductHistory": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {"JobName": "build-dim-product-scd2"},
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 1}],
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+      "Next": "BuildGoldStarSchema"
+    },
+    "BuildGoldStarSchema": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {"JobName": "build-gold-star-schema"},
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 1}],
+      "ResultPath": null,
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+      "Next": "ReloadRedshift"
+    },
+    "ReloadRedshift": {
+      "Type": "Task",
+      "Comment": "One batch = one transaction: readers see old or new data, never a mix",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:batchExecuteStatement",
+      "Parameters": {
+        "WorkgroupName": "review-intel-wg",
+        "Database": "dev",
+        "SecretArn": "arn:aws:secretsmanager:us-east-1:021882900412:secret:redshift!review-intel-ns-admin-mqlZ6X",
+        "Sqls": [
+          "DELETE FROM warehouse.dim_date",
+          "INSERT INTO warehouse.dim_date SELECT * FROM lake.dim_date",
+          "DELETE FROM warehouse.dim_product",
+          "INSERT INTO warehouse.dim_product SELECT * FROM lake.dim_product",
+          "DELETE FROM warehouse.fact_reviews",
+          "INSERT INTO warehouse.fact_reviews SELECT * FROM lake.fact_reviews",
+          "DELETE FROM warehouse.agg_product_monthly",
+          "INSERT INTO warehouse.agg_product_monthly SELECT * FROM lake.agg_product_monthly"
+        ]
+      },
+      "ResultSelector": {"Id.$": "$.Id"},
+      "ResultPath": "$.reload",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+      "Next": "WaitForReload"
+    },
+    "WaitForReload": {"Type": "Wait", "Seconds": 20, "Next": "CheckReload"},
+    "CheckReload": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+      "Parameters": {"Id.$": "$.reload.Id"},
+      "ResultPath": "$.reloadStatus",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+      "Next": "IsReloadDone"
+    },
+    "IsReloadDone": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.reloadStatus.Status", "StringEquals": "FINISHED", "Next": "NotifySuccess"},
+        {"Or": [
+          {"Variable": "$.reloadStatus.Status", "StringEquals": "FAILED"},
+          {"Variable": "$.reloadStatus.Status", "StringEquals": "ABORTED"}
+        ], "Next": "ReloadFailed"}
+      ],
+      "Default": "WaitForReload"
+    },
+    "ReloadFailed": {
+      "Type": "Pass",
+      "Parameters": {"Error": "RedshiftReloadFailed", "Cause.$": "States.JsonToString($.reloadStatus)"},
+      "ResultPath": "$.error",
+      "Next": "NotifyFailure"
+    },
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:021882900412:review-quality-alerts",
+        "Subject": "Review pipeline succeeded",
+        "Message.$": "States.Format('Batch pipeline finished. Execution: {}', $$.Execution.Name)"
+      },
+      "ResultPath": null,
+      "Next": "Done"
+    },
+    "Done": {"Type": "Succeed"},
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:021882900412:review-quality-alerts",
+        "Subject": "Review pipeline FAILED",
+        "Message.$": "States.Format('Execution {} failed. Details: {}', $$.Execution.Name, States.JsonToString($.error))"
+      },
+      "ResultPath": null,
+      "Next": "Failed"
+    },
+    "Failed": {"Type": "Fail", "Error": "PipelineFailed"}
+  }
+}
